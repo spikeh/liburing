@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <error.h>
+#include <openssl/md5.h>
 
 #include "liburing.h"
 
@@ -27,13 +28,18 @@ struct io_uring_zctap_iov {
 #define PAGE_SIZE		4096
 #endif
 
-#define FRAME_REGION_SIZE	(8192 * 4096)
+//#define FRAME_PAGE_COUNT	8192
+//#define FRAME_REGION_SIZE	(PAGE_SIZE * FRAME_PAGE_COUNT)
+//#define FILL_QUEUE_ENTRIES	(FRAME_PAGE_COUNT * 4)
+//#define FILL_QUEUE_ENTRIES	2048
 #define FILL_QUEUE_ENTRIES	4096
 #define COPY_QUEUE_ENTRIES	256
 #define COPY_BUF_SIZE		4096
 
+static __u8 *uref;
+
 enum {
-	BGID_ZC_REGION,
+	BGID_ZC_REGION,		/* iov[] from io_uring_register_buffers */
 	BGID_METADATA,
 	BGID_COPY_RING,
 	BGID_FILL_RING,
@@ -64,8 +70,14 @@ struct ctx {
 	int queue_id;
 	int ifq_id;
 	int verbose;
+	int out_fd;
+	int fillq_avail;
+	int region_pages;
 	bool udp;
+	bool use_md5;
 	char *ifname;
+	char *outfile;
+	MD5_CTX md5;
 	struct sendmsg_ctx send[BUFFERS];
 	size_t buf_ring_size;
 	size_t fillq_size;
@@ -126,6 +138,7 @@ static int setup_buffer_pool(struct ctx *ctx)
 	printf("metadata base region: %p, group %d\n",
 		ctx->buffer_base, BGID_METADATA);
 
+	printf("setup_buffer_pool calling io_uring_register_buf_ring with bgid=%d\n", reg.bgid);
 	ret = io_uring_register_buf_ring(&ctx->ring, &reg, 0);
 	if (ret) {
 		fprintf(stderr, "buf_ring init failed: %s\n"
@@ -167,12 +180,15 @@ static int setup_fill_queue(struct ctx *ctx)
 	};
 
 	/* flags is unused */
+	printf("setup_fill_queue calling io_uring_register_buf_ring with bgid=%d\n", reg.bgid);
 	ret = io_uring_register_buf_ring(&ctx->ring, &reg, 0);
 	if (ret) {
 		error(0, -ret, "fillq register failed");
 		fprintf(stderr, "NB This requires a kernel version >= 6.0\n");
 		exit(1);
 	}
+
+	ctx->fillq_avail = FILL_QUEUE_ENTRIES;
 
 	return 0;
 }
@@ -202,6 +218,7 @@ static int setup_copy_pool(struct ctx *ctx)
 	};
 
 	/* flags is unused */
+	printf("setup_copy_pool calling io_uring_register_buf_ring with bgid=%d\n", reg.bgid);
 	ret = io_uring_register_buf_ring(&ctx->ring, &reg, 0);
 	if (ret)
 		error(1, -ret, "copyq ring register failed");
@@ -334,6 +351,7 @@ static bool get_sqe(struct ctx *ctx, struct io_uring_sqe **sqe)
 	*sqe = io_uring_get_sqe(&ctx->ring);
 
 	if (!*sqe) {
+		printf("----- get_sqe: could not get sqe, doing an io_uring_submit then trying again\n");
 		io_uring_submit(&ctx->ring);
 		*sqe = io_uring_get_sqe(&ctx->ring);
 	}
@@ -354,6 +372,7 @@ static int wait_accept(struct ctx *ctx, int fd, int *clientfd)
 		return -1;
 
 	io_uring_prep_accept(sqe, fd, NULL, NULL, 0);
+	printf("----- wait_accept: calling io_uring_submit\n");
 	ret = io_uring_submit(&ctx->ring);
 	if (ret == -1) {
 		fprintf(stderr, "cannot submit accept\n");
@@ -365,12 +384,19 @@ static int wait_accept(struct ctx *ctx, int fd, int *clientfd)
 		fprintf(stderr, "accept wait_cqe\n");
 		return true;
 	}
+
+	fprintf(stderr, "accept cqe flags:%x res:%x\n", cqe->flags, cqe->res);
+
+	if (cqe->flags & IORING_CQE_F_NOTIF)
+		error(1, 0, "driver stalled due to undersized backing store");
+
 	*clientfd = cqe->res;
 	io_uring_cqe_seen(&ctx->ring, cqe);
 
 	return false;
 }
 
+#if 0
 /* adds one SQE for RECVMSG, as multishot */
 static int add_recv(struct ctx *ctx, int idx)
 {
@@ -387,6 +413,7 @@ static int add_recv(struct ctx *ctx, int idx)
 	io_uring_sqe_set_data64(sqe, BUFFERS + 1);
 	return 0;
 }
+#endif
 
 /* adds one SQE for RECVZC */
 static int add_recvzc(struct ctx *ctx, int idx_sockfd)
@@ -417,11 +444,106 @@ static int add_recvzc(struct ctx *ctx, int idx_sockfd)
 	readlen = 800000;
 	copy_bgid = BGID_COPY_RING;
 	sqe->addr3 = (readlen << 32) | (copy_bgid << 16) | ctx->ifq_id;
-//	printf("setting addr3: %llx\n", sqe->addr3);
+	printf("----- add_recvzc: setting addr3=%llx\n", sqe->addr3);
 
 	io_uring_sqe_set_data64(sqe, BUFFERS + 1);
 
 	return 0;
+}
+
+struct hold {
+	struct hold *next;
+	int count;
+	int num;
+	int max;
+	int buf[];
+};
+static struct hold *g_hold;
+static int g_hold_count;
+
+static struct hold *alloc_hold(void)
+{
+	struct hold *hold = g_hold;
+
+	hold = malloc(4096);
+	if (!hold)
+		error(1, 0, "malloc(4096)");
+	hold->next = g_hold;
+	hold->max = (4096 - sizeof(struct hold)) / sizeof(int);
+	hold->count = 0;
+	hold->num = ++g_hold_count;
+	g_hold = hold;
+
+	return hold;
+}
+
+static void hold_fill(struct ctx *ctx, int idx)
+{
+	struct hold *hold = g_hold;
+
+	if (!hold || hold->count == hold->max)
+		hold = alloc_hold();
+
+	uref[idx]++;
+	if (ctx->verbose)
+		printf("holding %d @ #%d %d/%d\n",
+			idx, hold->num, hold->count, hold->max);
+	hold->buf[hold->count++] = idx;
+}
+
+static void clear_fill(struct ctx *ctx, struct io_uring_cqe *cqe)
+{
+	int avail = cqe->res & 0xffff;
+	int i, count, holdidx, idx;
+	struct hold *hold;
+	void *addr;
+
+	if (ctx->verbose)
+		printf("clear fill:%llx flags:%x res:%x avail:%d\n",
+			cqe->user_data, cqe->flags, cqe->res, avail);
+
+	if (!avail) {
+		printf("driver stalled - no buffers available\n");
+		return;
+	}
+	ctx->fillq_avail += avail;
+
+retry:
+	hold = g_hold;
+	if (!hold)
+		return;
+
+	count = hold->count;
+	if (count > ctx->fillq_avail)
+		count = ctx->fillq_avail;
+	holdidx = hold->count - count;
+
+	if (ctx->verbose)
+		printf("returning %d/%d entries from #%d starting at %d\n",
+			count, hold->count, hold->num, holdidx);
+
+	for (i = 0; i < count; i++) {
+		idx = hold->buf[holdidx + i];
+		if (!uref[idx]) {
+			printf("SCREWUP, returning %d\n", idx);
+			exit(1);
+		}
+		uref[idx]--;
+		addr = (void *)(long)((BGID_ZC_REGION << 16) | idx);
+		io_uring_buf_ring_add(ctx->fillq,
+			addr, PAGE_SIZE, idx,
+			io_uring_buf_ring_mask(FILL_QUEUE_ENTRIES), i);
+	}
+	io_uring_buf_ring_advance(ctx->fillq, count);
+	ctx->fillq_avail -= count;
+
+	hold->count = holdidx;
+	if (!hold->count) {
+		g_hold = hold->next;
+		free(hold);
+		g_hold_count--;
+		goto retry;
+	}
 }
 
 static void recycle_bgid(struct ctx *ctx, int bgid, int idx)
@@ -432,6 +554,7 @@ static void recycle_bgid(struct ctx *ctx, int bgid, int idx)
 	switch (bgid) {
 	case BGID_METADATA:
 		ring = ctx->buf_ring;
+		//printf("----- recycle_bgid: BGID_METADATA, idx=%d, buffer sz=%ld, addr=%p\n", idx, buffer_size(ctx), get_buffer(ctx, idx));
 		io_uring_buf_ring_add(ring,
 			get_buffer(ctx, idx), buffer_size(ctx), idx,
 			io_uring_buf_ring_mask(BUFFERS), 0);
@@ -439,17 +562,22 @@ static void recycle_bgid(struct ctx *ctx, int bgid, int idx)
 	case BGID_COPY_RING:
 		ring = ctx->copyq;
 		addr = ctx->copy_base + (idx * COPY_BUF_SIZE);
+		//printf("----- recycle_bgid: BGID_COPY_RING, idx=%d, buffer sz=%d, addr=%p\n", idx, COPY_BUF_SIZE, addr);
 		io_uring_buf_ring_add(ring,
 			addr, COPY_BUF_SIZE, idx,
 			io_uring_buf_ring_mask(COPY_QUEUE_ENTRIES), 0);
 		break;
 	case BGID_ZC_REGION:
 	case BGID_FILL_RING:
+		if (!ctx->fillq_avail)
+			return hold_fill(ctx, idx);
 		ring = ctx->fillq;
 		addr = (void *)(((uintptr_t)bgid << 16) | idx);
+		//printf("----- recycle_bgid: BGID_FILL_RING, idx=%d, buffer sz=%d, addr=%p, fillq_avail=%d\n", idx, PAGE_SIZE, addr, ctx->fillq_avail);
 		io_uring_buf_ring_add(ring,
 			addr, PAGE_SIZE, idx,
 			io_uring_buf_ring_mask(FILL_QUEUE_ENTRIES), 0);
+		ctx->fillq_avail--;
 		break;
 	default:
 		error(1, 0, "unknown bgid %d\n", bgid);
@@ -458,13 +586,16 @@ static void recycle_bgid(struct ctx *ctx, int bgid, int idx)
 	io_uring_buf_ring_advance(ring, 1);
 }
 
+#if 0
 static void recycle_buffer(struct ctx *ctx, int idx)
 {
 	io_uring_buf_ring_add(ctx->buf_ring, get_buffer(ctx, idx), buffer_size(ctx), idx,
 			      io_uring_buf_ring_mask(BUFFERS), 0);
 	io_uring_buf_ring_advance(ctx->buf_ring, 1);
 }
+#endif
 
+#if 0
 static int process_cqe_send(struct ctx *ctx, struct io_uring_cqe *cqe)
 {
 	int idx = cqe->user_data;
@@ -474,6 +605,7 @@ static int process_cqe_send(struct ctx *ctx, struct io_uring_cqe *cqe)
 	recycle_buffer(ctx, idx);
 	return 0;
 }
+#endif
 
 static void
 hex_dump(void *data, size_t length, int frag)
@@ -484,6 +616,7 @@ hex_dump(void *data, size_t length, int frag)
 	unsigned char c;
 	char buf[32];
 	int i = 0;
+	printf("----- hex_dump: address=%p\n", address);
 
 	sprintf(buf, "%9.9d", frag);
 	printf("%s | ", buf);
@@ -514,15 +647,32 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 //	struct io_uring_recvmsg_out *o;
 //	struct io_uring_sqe *sqe;
 	int last_copybuf = -1;
+	printf("----- process_cqe: start, data=0x%llx flags=0x%x res=0x%x\n", cqe->user_data, cqe->flags, cqe->res);
+
+	if (ctx->verbose)
+		printf("--- CQE flags:%x res:%x data:%llx\n",
+			cqe->flags, cqe->res, cqe->user_data);
+
+	if (!cqe->user_data && !cqe->flags) {
+		printf("--- BAD CQE, ignoring.\n");
+		return 0;
+	}
+
+	if (cqe->flags & IORING_CQE_F_NOTIF) {
+		printf("----- process_cqe: IORING_CQE_F_NOTIF set, clearing fillq\n");
+		clear_fill(ctx, cqe);
+		return 0;
+	}
 
 	if (!(cqe->flags & IORING_CQE_F_MORE)) {
+		printf("----- process_cqe: IORING_CQE_F_MORE is not set, calling add_recvzc\n");
 		ret = add_recvzc(ctx, fdidx);
 		if (ret)
 			return ret;
 	}
 
 	if (cqe->res == 0) {
-		printf("EOF, res:%d flags:%d\n", cqe->res, cqe->flags);
+		printf("<!> EOF, flags:%x res:%x\n", cqe->flags, cqe->res);
 		return 1;
 	}
 
@@ -552,22 +702,19 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 		int i, bufid;
 
 		/* cqe flags contains the buffer index */
-		addr = get_buffer(ctx, cqe->flags >> 16);
+		addr = get_buffer(ctx, idx);
 
 		count = cqe->res / sizeof(*zov);
 		zov = addr;
+		printf("----- handle_zcrecv: idx=%d, addr=%p, count=%d\n", idx, addr, count);
 
-		if (ctx->verbose) {
-			int total = 0;
-			for (i = 0; i < count; i++)
-				total += zov[i].len;
-
-			printf("Buffer address: %p\n", addr);
-			printf("data length: %d, vectors:%d\n", total, count);
-		}
+		int total = 0;
+		for (i = 0; i < count; i++)
+			total += zov[i].len;
 		if (ctx->verbose > 1)
 			hex_dump(addr, cqe->res, 0);
 
+		printf("----- handle_zcrecv: start, data length=%d vectors=%d\n", total, count);
 		for (i = 0; i < count; i++) {
 			char *type;
 			if (zov[i].bgid == BGID_COPY_RING) {
@@ -582,23 +729,29 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 				type = "ZC";
 				ctx->zc_bytes += zov[i].len;
 			}
+			addr += zov[i].off;
 			if (ctx->verbose)
-				printf("%d: g:%d id:%d off:%d len:%d %s\n",
+				printf("%d: bgid:%d bid:%d off:%d len:%d addr:%p %s\n",
 					i, zov[i].bgid, zov[i].bid,
-					zov[i].off, zov[i].len, type);
+					zov[i].off, zov[i].len, addr, type);
 			if (ctx->verbose > 1)
-				hex_dump(addr + zov[i].off, zov[i].len, i);
+				hex_dump(addr, zov[i].len, i);
+			if (ctx->outfile)
+				write(ctx->out_fd, addr, zov[i].len);
+			if (ctx->use_md5)
+				MD5_Update(&ctx->md5, addr, zov[i].len);
 
 			bufid = zov[i].bid;
 			if (zov[i].bgid == BGID_COPY_RING) {
 				if (bufid == last_copybuf)
 					continue;
-				if (last_copybuf == -1) {
-					last_copybuf = bufid;
-					continue;
-				}
+				if (last_copybuf != -1)
+					recycle_bgid(ctx, zov[i].bgid,
+						     last_copybuf);
+				last_copybuf = bufid;
+			} else {
+				recycle_bgid(ctx, zov[i].bgid, bufid);
 			}
-			recycle_bgid(ctx, zov[i].bgid, bufid);
 		}
 	}
 
@@ -606,8 +759,10 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 	 * multiple times in a single recvzc call; but the buffer is not 
 	 * shared across multiple calls.
 	 */
-	if (last_copybuf != -1)
+	if (last_copybuf != -1) {
 		recycle_bgid(ctx, BGID_COPY_RING, last_copybuf);
+		printf("----- handle_zcrecv: calling recycle_bgid with bgid=BGID_COPY_RING\n");
+	}
 	recycle_bgid(ctx, BGID_METADATA, cqe->flags >> 16);
 
 #if 0
@@ -672,14 +827,17 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 	sqe->flags |= IOSQE_FIXED_FILE;
 #endif
 
+	printf("----- process_cqe: end\n");
 	return 0;
 }
 
 static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe, int fdidx)
 {
+#if 0
 	if (cqe->user_data < BUFFERS)
 		return process_cqe_send(ctx, cqe);
 	else
+#endif
 		return process_cqe_recv(ctx, cqe, fdidx);
 }
 
@@ -715,7 +873,7 @@ io_zctap_ifq(struct ctx *ctx)
 		fprintf(stderr, "register_ifq failed: %s\n", strerror(-ret));
 		return -1;
 	}
-	fprintf(stderr, "registered ifq:%d, r=%d\n", qid, ret);
+	fprintf(stderr, "registered ifq:%d\n", qid);
 	return ret;
 }
 
@@ -745,23 +903,31 @@ io_complete_sqe(struct io_uring *ring, struct io_uring_sqe *sqe,
 int setup_zctap_region(struct ctx *ctx)
 {
 	struct iovec iov;
+	size_t size;
 	void *area;
 	int ret;
 
-	area = mmap(NULL, FRAME_REGION_SIZE, PROT_READ | PROT_WRITE,
+	size = ctx->region_pages * PAGE_SIZE;
+	area = mmap(NULL, size, PROT_READ | PROT_WRITE,
 		      MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
 	if (area == MAP_FAILED)
 		error(1, errno, "frame_region mmap");
 
+	uref = malloc(ctx->region_pages);
+	if (!uref)
+		error(1, 0, "malloc uref failed");
+	memset(uref, 0, ctx->region_pages);
+
 	/* register (mmap) this buffer area with the kernel */
-	printf("frame base region: %p, group %d\n", area, BGID_ZC_REGION);
+	printf("frame base region:%p, group:%d pages:%d\n",
+		area, BGID_ZC_REGION, ctx->region_pages);
 	ctx->frame_base = area;
 
 	/* Registers (pins) memory with the kernel.
 	 * the region is identified by its position in the iov[] vector.
 	 */
 	iov.iov_base = area;
-	iov.iov_len = FRAME_REGION_SIZE;
+	iov.iov_len = size;
 	ret = io_uring_register_buffers(&ctx->ring, &iov, 1);
 	if (ret)
 		error(1, -ret, "register_buffers");
@@ -851,6 +1017,7 @@ int main(int argc, char *argv[])
 		.buf_shift	= BUF_SHIFT,
 		.ifname		= "eth0",
 		.queue_id	= -1,
+		.region_pages	= 1024,
 	};
 	int ret;
 	int port = -1;
@@ -860,7 +1027,7 @@ int main(int argc, char *argv[])
 	unsigned int count, i;
 	unsigned long start;
 
-	while ((opt = getopt(argc, argv, "46b:i:p:q:uv")) != -1) {
+	while ((opt = getopt(argc, argv, "46b:i:mo:p:q:r:uv")) != -1) {
 		switch (opt) {
 		case '4':
 			ctx.af = AF_INET;
@@ -874,11 +1041,18 @@ int main(int argc, char *argv[])
 		case 'i':
 			ctx.ifname = optarg;
 			break;
+		case 'm':
+			ctx.use_md5 = true;
+			MD5_Init(&ctx.md5);
+			break;
 		case 'p':
 			port = atoi(optarg);
 			break;
 		case 'q':
 			ctx.queue_id = atoi(optarg);
+			break;
+		case 'r':
+			ctx.region_pages = atoi(optarg);
 			break;
 		case 'u':
 			ctx.udp = true;
@@ -928,8 +1102,15 @@ int main(int argc, char *argv[])
 	if (ret)
 		return 1;
 
+	if (ctx.outfile) {
+		ctx.out_fd = open(ctx.outfile, O_RDWR|O_CREAT|O_TRUNC, 0444);
+		if (ctx.out_fd < 0)
+			error(1, errno, "open(%s)", ctx.outfile);
+	}
+
 	clientfd = sockfd;
 	if (!ctx.udp) {
+		printf("calling wait_accept\n");
 		ret = wait_accept(&ctx, sockfd, &clientfd);
 		if (ret) {
 			fprintf(stderr, "wait_accept: %s\n", strerror(-ret));
@@ -939,9 +1120,12 @@ int main(int argc, char *argv[])
 
 	start = now_nsec();
 
+	fprintf(stderr, "listen:%d client:%d\n", sockfd, clientfd);
+
 	/* optimization: register clientfd as file 0, avoiding lookups */
 	ret = io_uring_register_files(&ctx.ring, &clientfd, 1);
 	if (ret) {
+		error(1, -ret, "register files");
 		fprintf(stderr, "register files: %s\n", strerror(-ret));
 		return -1;
 	}
@@ -952,6 +1136,7 @@ int main(int argc, char *argv[])
 		return 1;
 
 	while (true) {
+		printf("----- main: calling io_uring_submit_and_wait\n");
 		ret = io_uring_submit_and_wait(&ctx.ring, 1);
 		if (ret == -EINTR)
 			continue;
@@ -970,6 +1155,17 @@ int main(int argc, char *argv[])
 	}
 
 cleanup:
+	if (ctx.use_md5) {
+		unsigned char md5[MD5_DIGEST_LENGTH];
+		char buf[40];
+		int i, pos;
+
+		MD5_Final(md5, &ctx.md5);
+		pos = sprintf(buf, "md5: ");
+		for (i = 0; i < MD5_DIGEST_LENGTH; i++)
+			pos += sprintf(&buf[pos], "%02x", md5[i]);
+		printf("%s\n", buf);
+	}
 	stats(&ctx, start);
 	cleanup_context(&ctx);
 	close(sockfd);

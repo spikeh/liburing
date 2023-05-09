@@ -2,7 +2,7 @@ CPPFLAGS ?=
 override CPPFLAGS += -D_GNU_SOURCE -I../src/include/
 CFLAGS ?= -g -O2 -Wall
 LDFLAGS ?=
-override LDFLAGS += -L../src/ -luring
+override LDFLAGS += -L../src/ -luring -lcrypto
 
 include ../Makefile.quiet
 
