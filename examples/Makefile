@@ -24,7 +24,8 @@ example_srcs := \
 	poll-bench.c \
 	send-zerocopy.c \
 	rsrc-update-bench.c \
-	proxy.c
+	proxy.c \
+	io_uring-net.c
 
 all_targets :=
 
