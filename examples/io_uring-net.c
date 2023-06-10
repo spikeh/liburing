@@ -180,7 +180,6 @@ static int setup_fill_queue(struct ctx *ctx)
 	};
 
 	/* flags is unused */
-	printf("setup_fill_queue calling io_uring_register_buf_ring with bgid=%d\n", reg.bgid);
 	ret = io_uring_register_buf_ring(&ctx->ring, &reg, 0);
 	if (ret) {
 		error(0, -ret, "fillq register failed");
@@ -866,6 +865,7 @@ io_zctap_ifq(struct ctx *ctx)
 		fprintf(stderr, "Interface %s does not exist\n", ctx->ifname);
 		return -1;
 	}
+	printf("----- io_zctap_ifq: register ifq, ifindex=%d, qid=%d, fill_bgid=%d\n", ifindex, qid, bgid);
 	ret = io_uring_register_ifq(&ctx->ring, ifindex, qid,
 				    ctx->ifq_id, bgid, region_id);
 
