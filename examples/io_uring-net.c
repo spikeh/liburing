@@ -443,7 +443,6 @@ static int add_recvzc(struct ctx *ctx, int idx_sockfd)
 	readlen = 800000;
 	copy_bgid = BGID_COPY_RING;
 	sqe->addr3 = (readlen << 32) | (copy_bgid << 16) | ctx->ifq_id;
-	printf("----- add_recvzc: setting addr3=%llx\n", sqe->addr3);
 
 	io_uring_sqe_set_data64(sqe, BUFFERS + 1);
 
