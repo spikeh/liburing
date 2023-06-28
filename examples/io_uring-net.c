@@ -138,7 +138,6 @@ static int setup_buffer_pool(struct ctx *ctx)
 	printf("metadata base region: %p, group %d\n",
 		ctx->buffer_base, BGID_METADATA);
 
-	printf("setup_buffer_pool calling io_uring_register_buf_ring with bgid=%d\n", reg.bgid);
 	ret = io_uring_register_buf_ring(&ctx->ring, &reg, 0);
 	if (ret) {
 		fprintf(stderr, "buf_ring init failed: %s\n"
@@ -217,7 +216,6 @@ static int setup_copy_pool(struct ctx *ctx)
 	};
 
 	/* flags is unused */
-	printf("setup_copy_pool calling io_uring_register_buf_ring with bgid=%d\n", reg.bgid);
 	ret = io_uring_register_buf_ring(&ctx->ring, &reg, 0);
 	if (ret)
 		error(1, -ret, "copyq ring register failed");
@@ -258,6 +256,8 @@ static int setup_context(struct ctx *ctx)
 	if (ret)
 		io_uring_queue_exit(&ctx->ring);
 
+	// XXX: Why is this needed?
+	// Used only in a ifdef 0 part
 	memset(&ctx->msg, 0, sizeof(ctx->msg));
 	ctx->msg.msg_namelen = sizeof(struct sockaddr_storage);
 	ctx->msg.msg_controllen = CONTROLLEN;
@@ -371,7 +371,6 @@ static int wait_accept(struct ctx *ctx, int fd, int *clientfd)
 		return -1;
 
 	io_uring_prep_accept(sqe, fd, NULL, NULL, 0);
-	printf("----- wait_accept: calling io_uring_submit\n");
 	ret = io_uring_submit(&ctx->ring);
 	if (ret == -1) {
 		fprintf(stderr, "cannot submit accept\n");
@@ -390,6 +389,7 @@ static int wait_accept(struct ctx *ctx, int fd, int *clientfd)
 		error(1, 0, "driver stalled due to undersized backing store");
 
 	*clientfd = cqe->res;
+	printf("----- wait_accept: sockfd=%d, clientfd=%d", fd, *clientfd);
 	io_uring_cqe_seen(&ctx->ring, cqe);
 
 	return false;
@@ -434,6 +434,7 @@ static int add_recvzc(struct ctx *ctx, int idx_sockfd)
 	 */
 
 	/* op, sqe, fd, addr, len, offset */
+	printf("----- add_recvzc: sockfd=%d\n", idx_sockfd);
 	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, idx_sockfd, NULL, 0, 0);
 	sqe->flags |= IOSQE_FIXED_FILE;
 
@@ -570,6 +571,8 @@ static void recycle_bgid(struct ctx *ctx, int bgid, int idx)
 		if (!ctx->fillq_avail)
 			return hold_fill(ctx, idx);
 		ring = ctx->fillq;
+		// XXX: This is a fake address only to store the bgid + bid (== idx)!
+		// Kernel will compute the real address from the ZC region base addr
 		addr = (void *)(((uintptr_t)bgid << 16) | idx);
 		//printf("----- recycle_bgid: BGID_FILL_RING, idx=%d, buffer sz=%d, addr=%p, fillq_avail=%d\n", idx, PAGE_SIZE, addr, ctx->fillq_avail);
 		io_uring_buf_ring_add(ring,
@@ -864,7 +867,7 @@ io_zctap_ifq(struct ctx *ctx)
 		fprintf(stderr, "Interface %s does not exist\n", ctx->ifname);
 		return -1;
 	}
-	printf("----- io_zctap_ifq: register ifq, ifindex=%d, qid=%d, fill_bgid=%d\n", ifindex, qid, bgid);
+	printf("----- io_zctap_ifq: register ifq, ifindex=%d, qid=%d, ifq_id=%d, fill_bgid=%d, region_id=%d\n", ifindex, qid, ctx->ifq_id, bgid, region_id);
 	ret = io_uring_register_ifq(&ctx->ring, ifindex, qid,
 				    ctx->ifq_id, bgid, region_id);
 
@@ -1109,7 +1112,6 @@ int main(int argc, char *argv[])
 
 	clientfd = sockfd;
 	if (!ctx.udp) {
-		printf("calling wait_accept\n");
 		ret = wait_accept(&ctx, sockfd, &clientfd);
 		if (ret) {
 			fprintf(stderr, "wait_accept: %s\n", strerror(-ret));
@@ -1121,6 +1123,7 @@ int main(int argc, char *argv[])
 
 	fprintf(stderr, "listen:%d client:%d\n", sockfd, clientfd);
 
+	// TODO: Migrate this to netbench?
 	/* optimization: register clientfd as file 0, avoiding lookups */
 	ret = io_uring_register_files(&ctx.ring, &clientfd, 1);
 	if (ret) {
