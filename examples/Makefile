@@ -25,7 +25,8 @@ example_srcs := \
 	send-zerocopy.c \
 	rsrc-update-bench.c \
 	proxy.c \
-	io_uring-net.c
+	io_uring-net.c \
+	zcrx.c
 
 all_targets :=
 
