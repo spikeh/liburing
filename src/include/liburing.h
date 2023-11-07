@@ -142,8 +142,9 @@ struct io_uring_rbuf_cqe {
 	__u32	off;
 	__u32	len;
 	__u16	region;
+	__u8	sock;
 	__u8	flags;
-	__u8	__pad[3];
+	__u8	__pad[2];
 };
 
 struct io_rbuf_rqring_offsets {
