@@ -10,8 +10,9 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <error.h>
-
+#include <assert.h>
 #include "liburing.h"
+#include "../src/syscall.h"
 
 #define IORING_OP_RECV_ZC	(IORING_OP_URING_CMD + 3)
 
@@ -20,6 +21,15 @@
 #define PAGE_SIZE 4096
 
 #define CQ_ENTRIES 512
+
+struct io_uring_zc_rx_sock_reg {
+	__u32	sockfd;
+	__u32	zc_rx_ifq_idx;
+	__u32	__resv[2];
+};
+
+
+static unsigned current_byte = 0;
 
 struct ctx {
 	struct io_uring		ring;
@@ -99,7 +109,8 @@ static void setup_ctx(struct ctx *ctx)
 	unsigned flags;
 	int ret;
 
-	flags = IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN;
+	flags = IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN |
+		IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;;
 
 	ret = io_uring_queue_init(QUEUE_DEPTH, &ctx->ring, flags);
 	if (ret < 0)
@@ -142,15 +153,19 @@ static void register_ifq(struct ctx *ctx)
 	if (!ifindex)
 		error(1, 0, "interface does not exist: eth0");
 
+	fprintf(stderr, "ifq index %i\n", ifindex);
+	// exit(1);
+
 	struct io_uring_zc_rx_ifq_reg reg = {
 		.if_idx = ifindex,
-		.if_rxq_id = 1,
+		.if_rxq_id = 0,
 		.region_id = 0,
 		.rq_entries = 4096,
 		.cq_entries = 4096,
 	};
 
 	ret = io_uring_register_ifq(&ctx->ring, ifindex, 1, 0, &reg);
+	printf("%i\n", ret);
 	if (ret)
 		error(1, -ret, "io_uring_register_ifq");
 
@@ -254,13 +269,13 @@ static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe, int fd)
 		return 1;
 	}
 
-	printf("----- process_cqe: cqe res=%d\n", cqe->res);
+	// printf("----- process_cqe: cqe res=%d\n", cqe->res);
 
 	unsigned count = cq_ready(&ctx->cq_ring);
 	unsigned cq_head = *ctx->cq_ring.khead;
 	unsigned cq_mask = ctx->cq_ring.ring_entries - 1;
 	unsigned cq_last = cq_head + count;
-	printf("----- process_cqe: completion ring count=%d, head=%d, mask=0x%x, last=%d\n", count, cq_head, cq_mask, cq_last);
+	// printf("----- process_cqe: completion ring count=%d, head=%d, mask=0x%x, last=%d\n", count, cq_head, cq_mask, cq_last);
 	int i = 0;
 	struct io_uring_rbuf_cqe *buf;
 	struct io_uring_rbuf_rqe *rbuf;
@@ -272,13 +287,27 @@ static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe, int fd)
 	}
 
 	unsigned rq_mask = ctx->rq_ring.ring_entries - 1;
-	printf("----- process_cqe: tail=%d, mask=0x%x\n", ctx->rq_ring.rq_tail, rq_mask);
+	// printf("----- process_cqe: tail=%d, mask=0x%x\n", ctx->rq_ring.rq_tail, rq_mask);
 
 	// for each cq ring entry, get the off + len
 	// TODO: only drain min of cq entries and free rq entries
 	for (; cq_head != cq_last; cq_head++, i++) {
 		buf = &ctx->cq_ring.cqes[(cq_head & cq_mask)];
-		printf("---- process_cqe: buf %d: off=%d, len=%d, flags=%d\n", i, buf->off, buf->len, buf->flags);
+		// printf("---- process_cqe: buf %d: off=%d, len=%d, flags=%d\n", i, buf->off, buf->len, buf->flags);
+
+		int j;
+		unsigned char *region = ctx->pool_base;
+		
+		// assert(buf->len == 4096);
+		/*
+		for (j = 0; j < buf->len; j++) {
+			if (region[buf->off + j] != (unsigned char)current_byte) {
+				fprintf(stderr, "mismatch idx %i: %i %i\n", j, (int)region[buf->off+j], (unsigned)(unsigned char)current_byte);
+				break;
+			}
+			current_byte++;
+		}	
+		*/
 
 		// modify the gail
 		// TODO: make sure rq ring is not full
@@ -298,10 +327,10 @@ static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe, int fd)
 		// submit_and_...?
 	}
 	// update cq head
-	printf("----- process_cqe: advancing cq ring head by %d\n", count);
+	// printf("----- process_cqe: advancing cq ring head by %d\n", count);
 	cq_advance(&ctx->cq_ring, count);
 	// update rq tail
-	printf("----- process_cqe: setting rq tail to %d\n", ctx->rq_ring.rq_tail);
+	// printf("----- process_cqe: setting rq tail to %d\n", ctx->rq_ring.rq_tail);
 	IO_URING_WRITE_ONCE(*ctx->rq_ring.ktail, ctx->rq_ring.rq_tail);
 
 	return 0;
@@ -324,6 +353,16 @@ int main(int argc, char *argv[])
 	register_ifq(&ctx);
 
 	clientfd = wait_accept(&ctx, sockfd);
+
+
+	#define IORING_REGISTER_ZC_RX_SOCK 27
+	struct io_uring_zc_rx_sock_reg reg = {};
+	reg.sockfd = clientfd;
+	reg.zc_rx_ifq_idx = 0;
+	ret = io_uring_register(ctx.ring.ring_fd, IORING_REGISTER_ZC_RX_SOCK, &reg, 1);
+	fprintf(stderr, "reg %i\n", ret);
+	if (ret < 0)
+		return -1;
 
 	ret = add_recvzc(&ctx, clientfd);
 	if (ret)
