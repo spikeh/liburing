@@ -144,7 +144,7 @@ struct io_uring_rbuf_cqe {
 	__u16	region;
 	__u8	sock;
 	__u8	flags;
-	__u8	__pad[2];
+	__u8	__pad[4];
 };
 
 struct io_rbuf_rqring_offsets {
@@ -170,13 +170,17 @@ struct io_uring_zc_rx_ifq_reg {
 	__u32	if_rxq_id;
 	__u32	region_id;
 	__u32	rq_entries;
-	__u32	cq_entries;
 	__u32	flags;
 	__u16	cpu;
 
 	__u32	mmap_sz;
 	struct io_rbuf_rqring_offsets rq_off;
-	struct io_rbuf_cqring_offsets cq_off;
+};
+
+struct io_uring_zc_rx_sock_reg {
+	__u32	sockfd;
+	__u32	zc_rx_ifq_idx;
+	__u32	__resv[2];
 };
 
 struct io_uring_rbuf_rq {

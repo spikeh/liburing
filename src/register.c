@@ -369,7 +369,7 @@ int io_uring_unregister_napi(struct io_uring *ring, struct io_uring_napi *napi)
 				IORING_UNREGISTER_NAPI, napi, 1);
 }
 
-#define IORING_REGISTER_ZC_RX_IFQ		26
+#define IORING_REGISTER_ZC_RX_IFQ		29
 
 int io_uring_register_ifq(struct io_uring *ring, int ifindex, __u16 queue_id,
 			  __u16 region_id, struct io_uring_zc_rx_ifq_reg *reg)

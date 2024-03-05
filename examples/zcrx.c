@@ -22,13 +22,6 @@
 
 #define CQ_ENTRIES 512
 
-struct io_uring_zc_rx_sock_reg {
-	__u32	sockfd;
-	__u32	zc_rx_ifq_idx;
-	__u32	__resv[2];
-};
-
-
 static unsigned current_byte = 0;
 
 struct ctx {
@@ -161,7 +154,6 @@ static void register_ifq(struct ctx *ctx)
 		.if_rxq_id = 0,
 		.region_id = 0,
 		.rq_entries = 4096,
-		.cq_entries = 4096,
 	};
 
 	ret = io_uring_register_ifq(&ctx->ring, ifindex, 1, 0, &reg);
@@ -169,7 +161,7 @@ static void register_ifq(struct ctx *ctx)
 	if (ret)
 		error(1, -ret, "io_uring_register_ifq");
 
-	ctx->ring_ptr = mmap(0, reg.mmap_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ctx->ring.enter_ring_fd, IORING_OFF_RBUF_RING);
+	ctx->ring_ptr = mmap(0, reg.mmap_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ctx->ring.enter_ring_fd, IORING_OFF_RQ_RING);
 	if (ctx->ring_ptr == MAP_FAILED)
 		fprintf(stderr, "----- register_ifq: mmap failed, %s\n", strerror(errno));
 	ctx->ring_sz = reg.mmap_sz;
@@ -179,11 +171,6 @@ static void register_ifq(struct ctx *ctx)
 	ctx->rq_ring.rqes = ctx->ring_ptr + reg.rq_off.rqes;
 	ctx->rq_ring.rq_tail = 0;
 	ctx->rq_ring.ring_entries = reg.rq_entries;
-
-	ctx->cq_ring.khead = ctx->ring_ptr + reg.cq_off.head;
-	ctx->cq_ring.ktail = ctx->ring_ptr + reg.cq_off.tail;
-	ctx->cq_ring.cqes = ctx->ring_ptr + reg.cq_off.cqes;
-	ctx->cq_ring.ring_entries = reg.cq_entries;
 }
 
 static int wait_accept(struct ctx *ctx, int fd)
