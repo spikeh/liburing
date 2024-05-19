@@ -131,6 +131,66 @@ struct io_uring {
 	unsigned pad2;
 };
 
+struct io_uring_rbuf_rqe {
+	__u64	off; /* upper 16 bits is area_id */
+	__u32	len;
+	__u8	__pad[4];
+};
+
+struct io_uring_rbuf_cqe {
+	__u64	off; /* upper 16 bits is area_id */
+	__u8	__pad[8];
+};
+
+#define IORING_RBUF_REGION_SHIFT	48
+
+struct io_uring_zcrx_offsets {
+	__u32	head;
+	__u32	tail;
+	__u32	rqes;
+	__u32	mmap_sz;
+};
+
+struct io_uring_zcrx_area_reg {
+	__u64	addr;
+	__u64	len;
+	__u32	flags;
+	__u16	area_id;
+	__u16	__resv1;
+	__u64	__resv2[3];
+};
+
+/*
+ * Argument for IORING_REGISTER_ZC_RX_IFQ
+ */
+struct io_uring_zcrx_ifq_reg {
+	__u32	if_idx;
+	__u32	if_rxq;
+	__u32	rq_entries;
+	__u32	flags;
+
+	__u64	area_ptr; /* pointer to struct io_uring_zcrx_area_reg */
+	struct io_uring_zcrx_offsets offsets;
+	__u64	__resv[3];
+};
+
+struct io_uring_zcrx_sock_reg {
+	__u32	sockfd;
+	__u32	zc_rx_ifq_idx;
+	__u32	__resv[2];
+};
+
+struct io_uring_rbuf_rq {
+	unsigned *khead;
+	unsigned *ktail;
+	struct io_uring_rbuf_rqe *rqes;
+
+	unsigned rq_tail;
+
+	void *ring_ptr;
+	unsigned ring_entries;
+};
+
 /*
  * Library interface
  */
@@ -240,6 +300,8 @@ int io_uring_register_file_alloc_range(struct io_uring *ring,
 
 int io_uring_register_napi(struct io_uring *ring, struct io_uring_napi *napi);
 int io_uring_unregister_napi(struct io_uring *ring, struct io_uring_napi *napi);
+int io_uring_register_ifq(struct io_uring *ring,
+			  struct io_uring_zcrx_ifq_reg *reg);
 
 int io_uring_get_events(struct io_uring *ring);
 int io_uring_submit_and_get_events(struct io_uring *ring);

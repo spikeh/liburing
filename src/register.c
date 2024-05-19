@@ -366,3 +366,9 @@ int io_uring_unregister_napi(struct io_uring *ring, struct io_uring_napi *napi)
 {
 	return do_register(ring, IORING_UNREGISTER_NAPI, napi, 1);
 }
+
+int io_uring_register_ifq(struct io_uring *ring,
+			  struct io_uring_zcrx_ifq_reg *reg)
+{
+	return do_register(ring, IORING_REGISTER_ZC_RX_IFQ, reg, 1);
+}
