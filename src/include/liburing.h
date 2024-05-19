@@ -131,6 +131,17 @@ struct io_uring {
 	unsigned pad2;
 };
 
+struct io_uring_zcrx_rq {
+	unsigned *khead;
+	unsigned *ktail;
+	struct io_uring_zcrx_rqe *rqes;
+
+	unsigned rq_tail;
+
+	void *ring_ptr;
+	unsigned ring_entries;
+};
+
 /*
  * Library interface
  */
@@ -240,6 +251,8 @@ int io_uring_register_file_alloc_range(struct io_uring *ring,
 
 int io_uring_register_napi(struct io_uring *ring, struct io_uring_napi *napi);
 int io_uring_unregister_napi(struct io_uring *ring, struct io_uring_napi *napi);
+int io_uring_register_ifq(struct io_uring *ring,
+			  struct io_uring_zcrx_ifq_reg *reg);
 
 int io_uring_get_events(struct io_uring *ring);
 int io_uring_submit_and_get_events(struct io_uring *ring);
